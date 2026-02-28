@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Rick's Last Stand</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+html, body { background:#111; width:100%; height:100%; overflow:hidden; touch-action:none; user-select:none; -webkit-user-select:none; }
+body { display:flex; flex-direction:column; align-items:center; justify-content:center; font-family:'Courier New',monospace; }
+#gameWrap { position:relative; }
+canvas { display:block; image-rendering:pixelated; image-rendering:crisp-edges; }
+#ui { position:absolute; top:0; left:0; right:0; padding:8px 12px; display:flex; justify-content:space-between; align-items:flex-start; pointer-events:none; }
+.hud-block { background:rgba(0,0,0,0.6); border:2px solid rgba(255,255,255,0.15); padding:5px 10px; border-radius:4px; }
+.hud-label { font-size:9px; color:#aaa; letter-spacing:2px; text-transform:uppercase; }
+.hud-val { font-size:18px; color:#fff; font-weight:bold; }
+#healthBar { width:110px; height:10px; background:#333; border-radius:5px; margin-top:3px; overflow:hidden; border:1px solid #555; }
+#healthFill { height:100%; background:linear-gradient(90deg,#ff4444,#ff8800); border-radius:5px; }
+.lives { font-size:14px; }
+#waveText { color:#ffdd00; font-size:10px; letter-spacing:1px; }
+#ammoBar { display:flex; gap:2px; margin-top:3px; flex-wrap:wrap; max-width:70px; }
+.shell { width:6px; height:11px; background:#f0c030; border-radius:2px; border:1px solid #a08010; }
+.shell.empty { background:#333; border-color:#555; }
+/* The control canvas sits below the game canvas */
+#ctrlCanvas { display:block; }
+</style>
+</head>
+<body>
+<div id="gameWrap">
+  <canvas id="c"></canvas>
+  <div id="ui">
+    <div class="hud-block">
+      <div class="hud-label">Health</div>
+      <div id="healthBar"><div id="healthFill" style="width:100%"></div></div>
+      <div class="lives" id="livesEl">❤️❤️❤️</div>
+    </div>
+    <div class="hud-block" style="text-align:center;">
+      <div class="hud-label">Score</div>
+      <div class="hud-val" id="scoreEl">0</div>
+      <div id="waveText">WAVE 1</div>
+    </div>
+    <div class="hud-block" style="text-align:right;">
+      <div class="hud-label">Ammo</div>
+      <div id="ammoBar"></div>
+    </div>
+  </div>
+</div>
+<!-- Separate control canvas outside gameWrap so it's below -->
+<canvas id="ctrlCanvas"></canvas>
+
+<script>
+// ════════════════════════════════
+// SETUP
+// ════════════════════════════════
+const C = document.getElementById('c');
+const ctx = C.getContext('2d');
+const GAME_W = 800, GAME_H = 480;
+C.width = GAME_W; C.height = GAME_H;
+ctx.imageSmoothingEnabled = false;
+const W = GAME_W, H = GAME_H;
+const GROUND = H - 70;
+
+const CC = document.getElementById('ctrlCanvas');
+const cctx = CC.getContext('2d');
+
+const CTRL_H = 150; // height of control strip in CSS px
+let scale = 1;
+let isMobile = false;
+
+// Button definitions in CTRL canvas coordinates (set in resize())
+// Each: { x, y, w, h, shape: 'rect'|'circle' }
+let BTN = {};
+
+function resize() {
+  isMobile = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  const ctrlStrip = isMobile ? CTRL_H : 0;
+  const availW = window.innerWidth;
+  const availH = window.innerHeight - ctrlStrip;
+  scale = Math.min(availW / GAME_W, availH / GAME_H);
+
+  const cw = Math.floor(GAME_W * scale);
+  const ch = Math.floor(GAME_H * scale);
+
+  C.style.width  = cw + 'px';
+  C.style.height = ch + 'px';
+
+  document.getElementById('gameWrap').style.width  = cw + 'px';
+  document.getElementById('gameWrap').style.height = ch + 'px';
+
+  if (isMobile) {
+    CC.style.display = 'block';
+    CC.width  = cw;
+    CC.height = CTRL_H;
+    CC.style.width  = cw + 'px';
+    CC.style.height = CTRL_H + 'px';
+    cctx.imageSmoothingEnabled = false;
+
+    // Define button zones in ctrl-canvas px coords
+    const BS = 58, GAP = 6, PAD = 16;
+    const shootR = 46; // radius
+
+    // D-pad (left side)
+    BTN.left   = { x: PAD,              y: CTRL_H - BS - 10,          w: BS, h: BS, shape:'rect' };
+    BTN.right  = { x: PAD + BS*2 + GAP*2, y: CTRL_H - BS - 10,       w: BS, h: BS, shape:'rect' };
+    BTN.up     = { x: PAD + BS + GAP,   y: CTRL_H - BS*2 - GAP - 10, w: BS, h: BS, shape:'rect' };
+
+    // Shoot (right side, circle)
+    BTN.shoot  = { x: cw - PAD - shootR*2, y: CTRL_H - shootR*2 - 10, w: shootR*2, h: shootR*2, shape:'circle' };
+
+    // Reload (above shoot)
+    BTN.reload = { x: cw - PAD - shootR*2, y: 10, w: shootR*2, h: 38, shape:'rect' };
+  } else {
+    CC.style.display = 'none';
+    BTN = {};
+  }
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ════════════════════════════════
+// TOUCH INPUT — document level
+// ════════════════════════════════
+const held = new Set();       // currently held button names
+const touchMap = {};          // identifier -> Set of button names
+
+function hitTest(tx, ty, btn) {
+  // tx,ty are in ctrl-canvas coordinates
+  if (btn.shape === 'circle') {
+    const cx = btn.x + btn.w/2, cy = btn.y + btn.h/2, r = btn.w/2;
+    return Math.hypot(tx - cx, ty - cy) <= r;
+  }
+  return tx >= btn.x && tx <= btn.x+btn.w && ty >= btn.y && ty <= btn.y+btn.h;
+}
+
+function touchToCtrl(touch) {
+  // Convert page touch coords to ctrl-canvas local coords
+  const rect = CC.getBoundingClientRect();
+  return { x: touch.clientX - rect.left, y: touch.clientY - rect.top };
+}
+
+function touchToGame(touch) {
+  const rect = C.getBoundingClientRect();
+  return { x: touch.clientX - rect.left, y: touch.clientY - rect.top };
+}
+
+function isOverCtrl(touch) {
+  const rect = CC.getBoundingClientRect();
+  return touch.clientY >= rect.top && touch.clientY <= rect.bottom &&
+         touch.clientX >= rect.left && touch.clientX <= rect.right;
+}
+
+function getBtnsForTouch(touch) {
+  if (!isMobile || !isOverCtrl(touch)) return new Set();
+  const {x, y} = touchToCtrl(touch);
+  const hits = new Set();
+  for (const [name, def] of Object.entries(BTN)) {
+    if (hitTest(x, y, def)) hits.add(name);
+  }
+  return hits;
+}
+
+function rebuildHeld() {
+  held.clear();
+  for (const s of Object.values(touchMap)) s.forEach(b => held.add(b));
+}
+
+// Handle menu-screen taps (anywhere on game canvas)
+function handleMenuTap() {
+  if (gamePhase === 'start' || gamePhase === 'dead') { initGame(); return true; }
+  if (gamePhase === 'winclear') { wave++; initGame(); return true; }
+  return false;
+}
+
+document.addEventListener('touchstart', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    // Menu tap — anywhere
+    if (gamePhase !== 'playing') { handleMenuTap(); return; }
+
+    const btns = getBtnsForTouch(t);
+    touchMap[t.identifier] = btns;
+
+    // Immediate actions
+    if (btns.has('shoot')) shoot();
+    if (btns.has('reload') && !reloading) startReload();
+  }
+  rebuildHeld();
+}, { passive: false });
+
+document.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    if (gamePhase !== 'playing') continue;
+    touchMap[t.identifier] = getBtnsForTouch(t);
+  }
+  rebuildHeld();
+}, { passive: false });
+
+document.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) delete touchMap[t.identifier];
+  rebuildHeld();
+}, { passive: false });
+
+document.addEventListener('touchcancel', e => {
+  for (const t of e.changedTouches) delete touchMap[t.identifier];
+  rebuildHeld();
+}, { passive: false });
+
+// ════════════════════════════════
+// KEYBOARD
+// ════════════════════════════════
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault();
+  if (e.code === 'KeyR' && gamePhase === 'playing' && !reloading) startReload();
+  if ((e.code==='Enter'||e.code==='Space') && gamePhase!=='playing') {
+    if (gamePhase==='winclear') wave++;
+    initGame();
+  }
+});
+document.addEventListener('keyup', e => keys[e.code] = false);
+
+// Input helpers
+let jumpWasHeld = false;
+function wantsLeft()  { return keys['ArrowLeft']  || keys['KeyA'] || held.has('left');  }
+function wantsRight() { return keys['ArrowRight'] || keys['KeyD'] || held.has('right'); }
+function wantsJump()  { return keys['ArrowUp'] || keys['KeyW'] || keys['Space'] || held.has('up'); }
+function wantsShoot() { return keys['KeyF'] || keys['KeyZ']; }
+
+// ════════════════════════════════
+// GAME STATE
+// ════════════════════════════════
+let state, score, wave=1, lives, frame=0;
+let enemies=[], bullets=[], particles=[], shells=[];
+let shotgunCooldown=0, reloading=false, ammo=6, maxAmmo=6;
+let gamePhase = 'start';
+
+function initGame() {
+  state = { rick:{ x:100, y:GROUND, vy:0, onGround:true, hp:100, maxHp:100, facing:1, anim:0, shooting:0, hurt:0, walking:false } };
+  score=0; lives=3; frame=0;
+  enemies=[]; bullets=[]; particles=[]; shells=[];
+  shotgunCooldown=0; reloading=false; ammo=6; jumpWasHeld=false;
+  gamePhase='playing';
+  spawnWave(wave);
+  updateHUD();
+}
+
+function spawnWave(w) {
+  const count = 3 + w*2;
+  for (let i=0; i<count; i++)
+    setTimeout(()=>{ if(gamePhase!=='playing')return; enemies.push(createEnemy(w)); }, i*1200);
+}
+
+function createEnemy(w) {
+  const side = Math.random()>0.5?1:-1;
+  const types = ['ninja']; if(w>=3)types.push('runner'); if(w>=5)types.push('jumper');
+  const type = types[~~(Math.random()*types.length)];
+  return { x:side===1?W+40:-40, y:GROUND, vy:0, onGround:true,
+    hp:type==='runner'?1:type==='jumper'?3:2, maxHp:type==='runner'?1:type==='jumper'?3:2,
+    speed:side===1?-(1.2+w*0.25+Math.random()*0.5):(1.2+w*0.25+Math.random()*0.5),
+    facing:side===-1?1:-1, type, anim:0, hurt:0, dead:false, attackCooldown:0, jumpTimer:type==='jumper'?120:99999 };
+}
+
+function startReload() {
+  if (ammo===maxAmmo||reloading) return;
+  reloading=true;
+  setTimeout(()=>{ ammo=maxAmmo; reloading=false; updateHUD(); }, 1500);
+}
+
+function shoot() {
+  if (ammo<=0||shotgunCooldown>0||reloading||!state) return;
+  ammo--; shotgunCooldown=25; state.rick.shooting=18; updateHUD();
+  const r=state.rick;
+  for(let i=0;i<5;i++) bullets.push({x:r.x+r.facing*28,y:r.y-32,vx:r.facing*(10+Math.random()*3),vy:(Math.random()-0.5)*2.5,life:40});
+  for(let i=0;i<10;i++) particles.push({x:r.x+r.facing*35,y:r.y-34,vx:r.facing*(3+Math.random()*6)+(Math.random()-0.5)*3,vy:(Math.random()-0.5)*4,life:1,color:'#ffdd00',size:3+Math.random()*4});
+  shells.push({x:r.x+r.facing*10,y:r.y-28,vx:-r.facing*3,vy:-4-Math.random()*2,rot:0,rotV:(Math.random()-0.5)*0.5,life:60});
+  if(ammo===0) startReload();
+}
+
+function spawnBlood(x,y,n=8){ for(let i=0;i<n;i++) particles.push({x,y,vx:(Math.random()-0.5)*5,vy:-Math.random()*4,life:1,color:['#ff2222','#cc0000','#ff6666'][~~(Math.random()*3)],size:3+Math.random()*3}); }
+function spawnStar(x,y){ for(let i=0;i<6;i++){const a=(i/6)*Math.PI*2; particles.push({x,y,vx:Math.cos(a)*3,vy:Math.sin(a)*3,life:1,color:'#ffdd00',size:4});} }
+
+// ════════════════════════════════
+// UPDATE
+// ════════════════════════════════
+function update() {
+  if (gamePhase!=='playing') return;
+  frame++;
+  const r = state.rick;
+  r.walking=false;
+  if(wantsLeft())  { r.x-=3.5; r.facing=-1; r.walking=true; }
+  if(wantsRight()) { r.x+=3.5; r.facing= 1; r.walking=true; }
+  r.x=Math.max(20,Math.min(W-20,r.x));
+
+  const jNow = wantsJump();
+  if(jNow && !jumpWasHeld && r.onGround){ r.vy=-13; r.onGround=false; }
+  jumpWasHeld=jNow;
+
+  r.vy+=0.6; r.y+=r.vy;
+  if(r.y>=GROUND){r.y=GROUND;r.vy=0;r.onGround=true;}
+
+  if(wantsShoot()&&shotgunCooldown===0) shoot();
+  if(shotgunCooldown>0)shotgunCooldown--;
+  if(r.shooting>0)r.shooting--;
+  if(r.hurt>0)r.hurt--;
+  r.anim=(r.anim+(r.walking?0.2:0.05))%(Math.PI*2);
+
+  bullets=bullets.filter(b=>b.life>0);
+  bullets.forEach(b=>{
+    b.x+=b.vx;b.y+=b.vy;b.vy+=0.15;b.life--;
+    enemies.forEach(e=>{ if(e.dead)return; if(Math.abs(b.x-e.x)<22&&Math.abs(b.y-(e.y-30))<30){e.hp--;b.life=0;e.hurt=10;spawnBlood(b.x,b.y,6);if(e.hp<=0)killEnemy(e);} });
+  });
+
+  shells=shells.filter(s=>s.life>0);
+  shells.forEach(s=>{s.x+=s.vx;s.y+=s.vy;s.vy+=0.4;s.rot+=s.rotV;s.life--;if(s.y>=GROUND-5){s.y=GROUND-5;s.vy*=-0.3;s.vx*=0.7;}});
+
+  enemies=enemies.filter(e=>!e.dead||e.deathTimer>0);
+  enemies.forEach(e=>{
+    if(e.dead){e.deathTimer--;return;}
+    e.anim+=0.18;if(e.hurt>0)e.hurt--;
+    const dx=r.x-e.x;e.facing=dx>0?1:-1;
+    if(Math.abs(dx)>35){
+      e.x+=e.speed;
+      if(e.type==='jumper'&&e.onGround){e.jumpTimer--;if(e.jumpTimer<=0){e.vy=-11;e.onGround=false;e.jumpTimer=80+Math.random()*60;}}
+    } else {
+      e.attackCooldown--;
+      if(e.attackCooldown<=0&&r.hurt===0){
+        r.hp-=10;r.hurt=30;spawnBlood(r.x,r.y-30,4);updateHUD();
+        if(r.hp<=0){lives--;updateHUD();if(lives<=0){gamePhase='dead';return;}else{r.hp=r.maxHp;r.hurt=60;}}
+        e.attackCooldown=60;
+      }
+    }
+    e.vy+=0.6;e.y+=e.vy;if(e.y>=GROUND){e.y=GROUND;e.vy=0;e.onGround=true;}
+    e.x=Math.max(-60,Math.min(W+60,e.x));
+  });
+
+  particles=particles.filter(p=>p.life>0);
+  particles.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vy+=0.1;p.life-=0.06;});
+
+  const alive=enemies.filter(e=>!e.dead);
+  if(alive.length===0&&frame>(3+wave*2)*1200/(1000/60)+120) gamePhase='winclear';
+}
+
+function killEnemy(e){
+  e.dead=true;e.deathTimer=20;
+  score+=e.type==='runner'?50:e.type==='jumper'?150:100;
+  spawnBlood(e.x,e.y-30,14);spawnStar(e.x,e.y-50);
+  document.getElementById('scoreEl').textContent=score;
+}
+
+// ════════════════════════════════
+// DRAW GAME
+// ════════════════════════════════
+function drawBG(){
+  const sky=ctx.createLinearGradient(0,0,0,H);sky.addColorStop(0,'#1a0533');sky.addColorStop(0.5,'#2d1b69');sky.addColorStop(1,'#0d1f4a');
+  ctx.fillStyle=sky;ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#fffbe0';ctx.beginPath();ctx.arc(680,70,45,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#e8d870';ctx.beginPath();ctx.arc(695,58,38,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#fffbe0';ctx.beginPath();ctx.arc(688,62,33,0,Math.PI*2);ctx.fill();
+  [[50,30],[120,60],[200,20],[300,45],[380,15],[450,70],[530,25],[600,55],[150,90],[250,75],[700,40],[760,80]].forEach(([sx,sy])=>{
+    ctx.globalAlpha=0.4+0.4*Math.sin(frame*0.03+sx);ctx.fillStyle='#fff';ctx.fillRect(sx,sy,2,2);});ctx.globalAlpha=1;
+  [[0,320,60,160],[65,300,50,180],[120,340,40,140],[165,310,70,170],[240,290,55,190],[300,330,45,150],[350,285,65,195],[420,310,50,170],[475,330,60,150],[540,295,55,185],[600,315,70,165],[675,300,50,180],[730,330,45,150],[780,290,60,190]]
+  .forEach(([bx,by,bw,bh])=>{
+    ctx.fillStyle='#0a0020';ctx.fillRect(bx,by,bw,bh);
+    for(let wy=by+10;wy<by+bh-10;wy+=18)for(let wx=bx+8;wx<bx+bw-8;wx+=12){ctx.fillStyle=`rgba(255,255,100,${Math.random()>0.6?0.7:0.1})`;ctx.fillRect(wx,wy,6,8);}
+  });
+  const gr=ctx.createLinearGradient(0,GROUND,0,H);gr.addColorStop(0,'#2a1a4a');gr.addColorStop(1,'#150d28');
+  ctx.fillStyle=gr;ctx.fillRect(0,GROUND,W,H-GROUND);
+  ctx.fillStyle='#7b4fa0';ctx.fillRect(0,GROUND,W,3);ctx.fillStyle='#5a3080';ctx.fillRect(0,GROUND+3,W,2);
+}
+
+function drawRick(r){
+  ctx.save();ctx.translate(r.x,r.y);if(r.facing===-1)ctx.scale(-1,1);
+  if(r.hurt>0&&Math.floor(r.hurt/3)%2===0)ctx.globalAlpha=0.5;
+  const bob=r.onGround?Math.sin(r.anim)*2:0;
+  ctx.fillStyle='#5522aa';ctx.fillRect(-14,-52+bob,28,42);
+  ctx.fillStyle='#4411aa';ctx.beginPath();ctx.moveTo(-18,-12+bob);ctx.lineTo(-22,8);ctx.lineTo(22,8);ctx.lineTo(18,-12+bob);ctx.closePath();ctx.fill();
+  ctx.fillStyle='#f0c030';ctx.fillRect(-15,-52+bob,3,42);ctx.fillRect(12,-52+bob,3,42);ctx.fillRect(-18,-14+bob,36,3);
+  ctx.fillStyle='#aaddff';[[0,-40+bob],[-7,-30+bob],[6,-25+bob]].forEach(([sx,sy])=>{ctx.fillRect(sx-1,sy-1,3,3);ctx.fillRect(sx,sy-2,1,5);ctx.fillRect(sx-2,sy,5,1);});
+  ctx.fillStyle='#6633bb';ctx.fillRect(-10,-58+bob,20,14);
+  ctx.fillStyle='#ddeeff';ctx.beginPath();ctx.ellipse(0,-44+bob,8,10,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#bbccdd';ctx.beginPath();ctx.moveTo(-7,-46+bob);ctx.lineTo(-5,-36+bob);ctx.lineTo(0,-40+bob);ctx.lineTo(5,-36+bob);ctx.lineTo(7,-46+bob);ctx.closePath();ctx.fill();
+  ctx.fillStyle='#f5c8a0';ctx.beginPath();ctx.ellipse(0,-64+bob,13,14,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#fff';ctx.fillRect(-7,-67+bob,7,6);ctx.fillRect(1,-67+bob,7,6);
+  ctx.fillStyle='#2244ff';ctx.fillRect(-5,-66+bob,4,4);ctx.fillRect(3,-66+bob,4,4);
+  ctx.fillStyle='#000';ctx.fillRect(-4,-65+bob,2,2);ctx.fillRect(4,-65+bob,2,2);
+  ctx.fillStyle='#555';ctx.fillRect(-8,-70+bob,7,2);ctx.fillRect(2,-70+bob,7,2);
+  ctx.fillStyle='#ddeeff';ctx.beginPath();ctx.ellipse(-4,-57+bob,4,2,0.3,0,Math.PI*2);ctx.fill();ctx.beginPath();ctx.ellipse(4,-57+bob,4,2,-0.3,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#3311aa';ctx.beginPath();ctx.moveTo(0,-98+bob);ctx.lineTo(-18,-74+bob);ctx.lineTo(18,-74+bob);ctx.closePath();ctx.fill();
+  ctx.fillStyle='#5533cc';ctx.beginPath();ctx.ellipse(0,-74+bob,22,5,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#f0c030';ctx.fillRect(-22,-79+bob,44,5);ctx.fillStyle='#ffdd55';ctx.fillRect(-2,-94+bob,4,4);ctx.fillRect(-4,-92+bob,8,2);
+  ctx.save();ctx.translate(14,-36+bob+(r.shooting>0?-2:0));
+  ctx.fillStyle='#8B4513';ctx.fillRect(0,0,20,8);ctx.fillRect(0,2,5,10);
+  ctx.fillStyle='#888';ctx.fillRect(5,-4,30,5);ctx.fillStyle='#777';ctx.fillRect(5,-9,28,4);
+  ctx.fillStyle='#444';ctx.fillRect(33,-10,4,10);ctx.fillStyle='#555';ctx.fillRect(14,-4,8,13);
+  if(r.shooting>0){ctx.fillStyle='#ffee44';ctx.beginPath();ctx.arc(38,-5,6,0,Math.PI*2);ctx.fill();ctx.fillStyle='#fff';ctx.beginPath();ctx.arc(38,-5,3,0,Math.PI*2);ctx.fill();}
+  ctx.restore();
+  ctx.fillStyle='#6633bb';ctx.fillRect(10,-48+bob,8,16);ctx.fillRect(-18,-48+bob,8,16);
+  ctx.fillStyle='#f5c8a0';ctx.fillRect(10,-34+bob,8,8);ctx.fillRect(-18,-34+bob,8,8);
+  ctx.fillStyle=`hsla(${frame*3},100%,70%,0.5)`;ctx.beginPath();ctx.arc(-14,-28+bob+Math.sin(frame*0.05)*3,6,0,Math.PI*2);ctx.fill();
+  ctx.globalAlpha=1;ctx.restore();
+}
+
+function drawNinja(e){
+  if(e.dead&&e.deathTimer<10)return;
+  ctx.save();ctx.translate(e.x,e.y);if(e.facing===-1)ctx.scale(-1,1);
+  if(e.dead)ctx.globalAlpha=e.deathTimer/20;
+  if(e.hurt>0&&Math.floor(e.hurt/2)%2===0)ctx.globalAlpha=0.5;
+  const bob=e.onGround?Math.sin(e.anim)*3:0,S=e.type==='runner'?0.85:e.type==='jumper'?1.1:1;
+  ctx.scale(S,S);const ac='#ff2222';
+  ctx.fillStyle='#111';ctx.fillRect(-10,-10+bob,8,18);ctx.fillRect(2,-10+bob,8,18);
+  ctx.fillStyle='#222';ctx.fillRect(-12,5,10,6);ctx.fillRect(2,5,10,6);
+  ctx.fillStyle='#1a1a1a';ctx.fillRect(-13,-42+bob,26,34);
+  ctx.fillStyle=ac;ctx.fillRect(-4,-35+bob,8,10);ctx.fillRect(-7,-29+bob,14,4);ctx.fillStyle='#000';ctx.fillRect(-2,-33+bob,4,6);
+  ctx.fillStyle='#333';ctx.fillRect(-14,-12+bob,28,5);ctx.fillStyle=ac;ctx.fillRect(-3,-12+bob,6,5);
+  ctx.save();ctx.translate(-13,-38+bob);ctx.rotate(-Math.sin(e.anim)*0.3);ctx.fillStyle='#111';ctx.fillRect(-7,0,9,22);
+  if(e.type==='jumper'){ctx.fillStyle='#aaa';ctx.fillRect(-4,20,5,10);ctx.fillRect(-5,18,7,4);}else{ctx.fillStyle='#222';ctx.fillRect(-5,20,8,8);}ctx.restore();
+  ctx.save();ctx.translate(13,-38+bob);ctx.rotate(Math.sin(e.anim)*0.3);ctx.fillStyle='#111';ctx.fillRect(-2,0,9,22);ctx.restore();
+  ctx.fillStyle='#0a0a0a';ctx.beginPath();ctx.ellipse(0,-52+bob,13,14,0,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle=ac;ctx.fillRect(-9,-54+bob,18,4);ctx.fillStyle='#ff6666';ctx.fillRect(-7,-53+bob,5,2);ctx.fillRect(2,-53+bob,5,2);
+  ctx.fillStyle='#1a1a1a';ctx.fillRect(-14,-62+bob,28,12);ctx.fillStyle=ac;ctx.fillRect(-14,-58+bob,28,4);ctx.fillStyle='#cc0000';ctx.fillRect(-3,-59+bob,6,6);
+  ctx.fillStyle='#fff';ctx.font='5px Courier New';ctx.textAlign='center';ctx.fillText('NL',0,-53+bob);
+  if(e.hp<e.maxHp&&e.maxHp>1){ctx.fillStyle='#333';ctx.fillRect(-20,-85+bob,40,5);ctx.fillStyle='#f22';ctx.fillRect(-20,-85+bob,40*(e.hp/e.maxHp),5);}
+  ctx.globalAlpha=1;ctx.restore();
+}
+
+function drawBullets(){bullets.forEach(b=>{ctx.save();ctx.translate(b.x,b.y);ctx.rotate(Math.atan2(b.vy,b.vx));ctx.fillStyle='#ffdd44';ctx.fillRect(-4,-2,8,4);ctx.globalAlpha=0.4;ctx.fillStyle='#ffaa00';ctx.fillRect(-12,-1,10,2);ctx.globalAlpha=1;ctx.restore();});}
+function drawShells(){shells.forEach(s=>{ctx.save();ctx.translate(s.x,s.y);ctx.rotate(s.rot);ctx.fillStyle='#d4a020';ctx.fillRect(-2,-5,4,10);ctx.fillStyle='#ff4400';ctx.fillRect(-2,-5,4,3);ctx.restore();});}
+function drawParticles(){particles.forEach(p=>{ctx.globalAlpha=Math.max(0,p.life);ctx.fillStyle=p.color;ctx.fillRect(p.x-p.size/2,p.y-p.size/2,p.size,p.size);});ctx.globalAlpha=1;}
+
+function drawScreen(title,sub,sub2,color){
+  ctx.fillStyle='rgba(0,0,0,0.78)';ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';ctx.fillStyle=color||'#ffd700';ctx.font='bold 38px Courier New';ctx.fillText(title,W/2,H/2-70);
+  ctx.fillStyle='#fff';ctx.font='16px Courier New';ctx.fillText(sub,W/2,H/2-20);
+  if(sub2){ctx.fillStyle='#aaa';ctx.font='12px Courier New';ctx.fillText(sub2,W/2,H/2+15);}
+  if(Math.floor(frame/20)%2===0){ctx.fillStyle='#ffdd00';ctx.font='bold 14px Courier New';ctx.fillText(isMobile?'[ TAP ANYWHERE ]':'[ CLICK or ENTER ]',W/2,H/2+65);}
+  ctx.textAlign='left';
+}
+
+// ════════════════════════════════
+// DRAW CONTROLS (on ctrl canvas)
+// ════════════════════════════════
+function drawControls(){
+  if(!isMobile||!CC.width)return;
+  cctx.clearRect(0,0,CC.width,CC.height);
+
+  function drawBtn(def, label, isHeld, isCircle){
+    const alpha = isHeld ? 0.85 : 0.45;
+    cctx.save();
+    cctx.globalAlpha = alpha;
+    cctx.fillStyle   = isHeld ? 'rgba(255,210,30,0.4)'  : 'rgba(255,255,255,0.12)';
+    cctx.strokeStyle = isHeld ? 'rgba(255,220,60,1)'    : 'rgba(255,255,255,0.35)';
+    cctx.lineWidth = 2.5;
+    if(isCircle){
+      const cx=def.x+def.w/2, cy=def.y+def.h/2, r=def.w/2-1;
+      cctx.beginPath();cctx.arc(cx,cy,r,0,Math.PI*2);cctx.fill();cctx.stroke();
+    } else {
+      cctx.beginPath();cctx.roundRect(def.x,def.y,def.w,def.h,10);cctx.fill();cctx.stroke();
+    }
+    cctx.globalAlpha=isHeld?1:0.85;
+    cctx.fillStyle='#fff';
+    cctx.font=`bold ${isCircle?'26':'20'}px Courier New`;
+    cctx.textAlign='center';cctx.textBaseline='middle';
+    cctx.fillText(label, def.x+def.w/2, def.y+def.h/2);
+    cctx.restore();
+  }
+
+  drawBtn(BTN.left,  '◀', held.has('left'));
+  drawBtn(BTN.right, '▶', held.has('right'));
+  drawBtn(BTN.up,    '▲', held.has('up'));
+  drawBtn(BTN.shoot, '🔫', held.has('shoot'), true);
+
+  // Reload button
+  const rr=BTN.reload;
+  cctx.save();
+  cctx.globalAlpha=reloading?0.4:0.45;
+  cctx.fillStyle=reloading?'rgba(255,80,80,0.2)':'rgba(60,200,60,0.15)';
+  cctx.strokeStyle=reloading?'rgba(255,80,80,0.5)':'rgba(60,220,60,0.5)';
+  cctx.lineWidth=2;
+  cctx.beginPath();cctx.roundRect(rr.x,rr.y,rr.w,rr.h,8);cctx.fill();cctx.stroke();
+  cctx.globalAlpha=0.9;cctx.fillStyle=reloading?'#ffaaaa':'#aaffaa';
+  cctx.font='11px Courier New';cctx.textAlign='center';cctx.textBaseline='middle';
+  cctx.fillText(reloading?'↺ reloading...':'↺ RELOAD', rr.x+rr.w/2, rr.y+rr.h/2);
+  cctx.restore();
+}
+
+// ════════════════════════════════
+// HUD + LOOP
+// ════════════════════════════════
+function updateHUD(){
+  const r=state?.rick;if(!r)return;
+  document.getElementById('healthFill').style.width=Math.max(0,(r.hp/r.maxHp)*100)+'%';
+  document.getElementById('livesEl').textContent='❤️'.repeat(Math.max(0,lives));
+  document.getElementById('scoreEl').textContent=score;
+  document.getElementById('waveText').textContent=`WAVE ${wave}`;
+  const el=document.getElementById('ammoBar');el.innerHTML='';
+  for(let i=0;i<maxAmmo;i++){const s=document.createElement('div');s.className='shell'+(i>=ammo?' empty':'');el.appendChild(s);}
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  drawBG();drawShells();drawParticles();
+  if(gamePhase!=='start'){enemies.forEach(drawNinja);drawBullets();drawRick(state.rick);}
+  if(gamePhase==='start')    drawScreen("RICK'S LAST STAND","Wizard vs. The NL Ninjas",isMobile?"D-PAD:move  ▲:jump  🔫:shoot":"WASD/Arrows:move  F:shoot  R:reload");
+  if(gamePhase==='dead')     drawScreen("YOU DIED",`Score: ${score}`,"The NLs got Rick...",'#ff4444');
+  if(gamePhase==='winclear') drawScreen(`WAVE ${wave} CLEARED!`,`Score: ${score}`,`Brace for Wave ${wave+1}!`,'#44ff88');
+  drawControls();
+}
+
+function loop(){ update(); draw(); updateHUD(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>
